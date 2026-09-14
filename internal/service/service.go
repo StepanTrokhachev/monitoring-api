@@ -110,10 +110,17 @@ func (s *EventService) Poll(ctx context.Context) error {
 	s.log.Info("новые события", zap.Int("count", len(events)))
 
 	// Обогащаем через ML-сервис (внутри разбивается на чанки по mlChunkSize)
-	enriched, err := s.enrichBatch(ctx, events)
+	enriched, err := s.enrichBatch(ctx, events, true)
 	if err != nil {
-		s.log.Warn("ML batch failed, используем события без score", zap.Error(err))
-		enriched = events
+		// Событие без оценки аномальности бесполезно и искажает статистику:
+		// сохранённое с score = 0 оно будет учтено как заведомо нормальное.
+		// Пропускаем цикл целиком — lastID не сдвигается, и следующий
+		// цикл повторит обработку этих же событий.
+		s.log.Error("обогащение не выполнено, цикл пропущен",
+			zap.Int("count", len(events)),
+			zap.Error(err),
+		)
+		return fmt.Errorf("ml enrich: %w", err)
 	}
 
 	// Сохраняем в репозиторий
@@ -180,8 +187,46 @@ const mlChunkSize = 200
 // mlWorkers — количество параллельных горутин для отправки чанков.
 const mlWorkers = 4
 
+// computeBursts вычисляет burst_10min для каждого события среза:
+// число событий того же пользователя за 10 минут, предшествующих событию,
+// включая само событие. Границы окна — [t-10min, t], как в обучающем
+// конвейере (features.build_features_batch после перевода на окно назад).
+//
+// withRepoHistory управляет учётом уже сохранённой истории:
+//   - true  (Poll): события батча ещё не в репозитории, историю берём оттуда;
+//   - false (ReEnrich): срез содержит весь журнал целиком, и те же события
+//     уже лежат в репозитории — обращение к нему дало бы двойной счёт.
+func (s *EventService) computeBursts(events []model.AccessEvent, withRepoHistory bool) []int {
+	bursts := make([]int, len(events))
+	// Метки времени уже просмотренных событий батча по пользователям.
+	seen := make(map[int64][]time.Time, len(events))
+
+	for i, ev := range events {
+		from := ev.AccessDate.Add(-10 * time.Minute)
+
+		count := 0
+		if withRepoHistory {
+			count = s.repo.CountUserEventsInWindow(ev.UserID, from, ev.AccessDate)
+		}
+
+		// Предшествующие события того же пользователя внутри текущего среза.
+		for _, t := range seen[ev.UserID] {
+			if !t.Before(from) && !t.After(ev.AccessDate) {
+				count++
+			}
+		}
+
+		bursts[i] = count + 1 // само событие
+		seen[ev.UserID] = append(seen[ev.UserID], ev.AccessDate)
+	}
+	return bursts
+}
+
 // enrichBatch параллельно обогащает события через ML (worker pool).
-func (s *EventService) enrichBatch(ctx context.Context, events []model.AccessEvent) ([]model.AccessEvent, error) {
+// burst_10min считается здесь, до разбиения на чанки: значение зависит от
+// предшествующих событий пользователя, и внутри отдельного чанка они видны
+// лишь частично.
+func (s *EventService) enrichBatch(ctx context.Context, events []model.AccessEvent, withRepoHistory bool) ([]model.AccessEvent, error) {
 	total := len(events)
 	numChunks := (total + mlChunkSize - 1) / mlChunkSize
 
@@ -190,6 +235,8 @@ func (s *EventService) enrichBatch(ctx context.Context, events []model.AccessEve
 		zap.Int("chunks", numChunks),
 		zap.Int("workers", mlWorkers),
 	)
+
+	bursts := s.computeBursts(events, withRepoHistory)
 
 	type job struct{ start, end int }
 	jobs := make(chan job, numChunks)
@@ -204,7 +251,7 @@ func (s *EventService) enrichBatch(ctx context.Context, events []model.AccessEve
 		go func() {
 			defer wg.Done()
 			for j := range jobs {
-				if err := s.enrichChunk(ctx, events[j.start:j.end]); err != nil {
+				if err := s.enrichChunk(ctx, events[j.start:j.end], bursts[j.start:j.end]); err != nil {
 					s.log.Warn("chunk failed",
 						zap.Int("start", j.start),
 						zap.Int("end", j.end),
@@ -235,12 +282,14 @@ func (s *EventService) enrichBatch(ctx context.Context, events []model.AccessEve
 }
 
 // enrichChunk отправляет один чанк в ML и записывает результаты обратно в срез.
-func (s *EventService) enrichChunk(ctx context.Context, events []model.AccessEvent) error {
+// bursts — заранее посчитанные значения burst_10min, параллельные events.
+func (s *EventService) enrichChunk(ctx context.Context, events []model.AccessEvent, bursts []int) error {
 	type mlEvent struct {
 		IP         string `json:"ip"`
 		UserID     int64  `json:"user_id"`
 		TaskID     int64  `json:"task_id"`
 		AccessDate string `json:"access_date"`
+		Burst10Min int    `json:"burst_10min"`
 	}
 	type mlRequest struct {
 		Events []mlEvent `json:"events"`
@@ -263,6 +312,7 @@ func (s *EventService) enrichChunk(ctx context.Context, events []model.AccessEve
 			UserID:     ev.UserID,
 			TaskID:     ev.TaskID,
 			AccessDate: ev.AccessDate.Format("2006-01-02T15:04:05"),
+			Burst10Min: bursts[i],
 		}
 	}
 
@@ -318,7 +368,13 @@ func (s *EventService) sendAlerts(events []model.AccessEvent) {
 
 	for _, ev := range events {
 		if ev.AnomalyScore >= thr {
-			s.mailer.SendAlert(ev, thr, rcpt)
+			if err := s.mailer.SendAlert(ev, thr, rcpt); err != nil {
+				s.log.Warn("не удалось отправить алерт",
+					zap.Int64("user_id", ev.UserID),
+					zap.Error(err),
+				)
+				continue
+			}
 			s.log.Info("алерт отправлен",
 				zap.Int64("user_id", ev.UserID),
 				zap.Float64("score", ev.AnomalyScore),
@@ -380,9 +436,10 @@ func (s *EventService) ReEnrich() error {
 		zap.Int("chunk_size", mlChunkSize),
 	)
 
-	// Обогащаем с новыми профилями (параллельно по чанкам)
+	// Обогащаем с новыми профилями (параллельно по чанкам).
+	// withRepoHistory = false: срез уже содержит весь журнал целиком.
 	ctx := context.Background()
-	enriched, err := s.enrichBatch(ctx, events)
+	enriched, err := s.enrichBatch(ctx, events, false)
 	if err != nil {
 		s.log.Warn("ReEnrich: ML частично не ответил", zap.Error(err))
 		enriched = events // используем что есть
@@ -407,22 +464,19 @@ func (s *EventService) ReEnrich() error {
 	}
 	s.repo = newRepo
 
-	//// Push обновлённых аномалий в WebSocket
-	//aномалии := make([]model.AccessEvent, 0)
-	//for _, ev := range enriched {
-	//	if ev.IsAnomaly {
-	//		anomEvents = append(anomEvents, ev)
-	//	}
-	//}
-	//if s.onNew != nil && len(anomEvents) > 0 {
-	//	s.onNew(anomEvents)
-	//}
-	//
-	//aномCount := len(аномалии)
-	//s.log.Info("ReEnrich завершён",
-	//	zap.Int("total", len(enriched)),
-	//	zap.Int("anomalies", nomCount),
-	//	zap.Float64("pct", float64(nomCount)/float64(len(enriched))*100),
-	//)
+	// Push обновлённых аномалий в WebSocket
+	var anomEvents []model.AccessEvent
+	for _, ev := range enriched {
+		if ev.IsAnomaly {
+			anomEvents = append(anomEvents, ev)
+		}
+	}
+	if s.onNew != nil && len(anomEvents) > 0 {
+		s.onNew(anomEvents)
+	}
+	s.log.Info("ReEnrich завершён",
+		zap.Int("total", len(enriched)),
+		zap.Int("anomalies", len(anomEvents)),
+	)
 	return nil
 }

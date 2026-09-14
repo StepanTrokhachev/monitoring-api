@@ -22,6 +22,7 @@ type EventRepo interface {
 	GetByID(id int64) (model.AccessEvent, error)
 	GetSummary() (model.Summary, error)
 	GetUserHourly(userID int64) []model.HourlyStat
+	CountUserEventsInWindow(userID int64, from, to time.Time) int
 }
 
 // ─────────────────────────────────────────────
@@ -29,13 +30,14 @@ type EventRepo interface {
 // ─────────────────────────────────────────────
 
 type MemoryRepo struct {
-	mu     sync.RWMutex
-	events []model.AccessEvent
-	lastID int64
+	mu        sync.RWMutex
+	events    []model.AccessEvent
+	lastID    int64
+	userTimes map[int64][]time.Time // user_id → отсортированные метки времени
 }
 
 func NewMemoryRepo() *MemoryRepo {
-	return &MemoryRepo{}
+	return &MemoryRepo{userTimes: make(map[int64][]time.Time)}
 }
 
 func (r *MemoryRepo) Save(events []model.AccessEvent) error {
@@ -44,13 +46,43 @@ func (r *MemoryRepo) Save(events []model.AccessEvent) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.userTimes == nil {
+		r.userTimes = make(map[int64][]time.Time)
+	}
+	touched := make(map[int64]struct{}, len(events))
 	for _, ev := range events {
 		r.events = append(r.events, ev)
 		if ev.ID > r.lastID {
 			r.lastID = ev.ID
 		}
+		r.userTimes[ev.UserID] = append(r.userTimes[ev.UserID], ev.AccessDate)
+		touched[ev.UserID] = struct{}{}
+	}
+	// Поддерживаем отсортированность затронутых пользователей:
+	// CountUserEventsInWindow полагается на бинарный поиск.
+	for uid := range touched {
+		ts := r.userTimes[uid]
+		sort.Slice(ts, func(i, j int) bool { return ts[i].Before(ts[j]) })
+		r.userTimes[uid] = ts
 	}
 	return nil
+}
+
+// CountUserEventsInWindow возвращает число событий пользователя
+// с меткой времени в отрезке [from, to]. Границы совпадают с окном
+// назад, которое используется при обучении (features.build_features_batch),
+// поэтому событие ровно на границы окна учитывается.
+// Бинарный поиск по отсортированному индексу, сложность O(log n).
+func (r *MemoryRepo) CountUserEventsInWindow(userID int64, from, to time.Time) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	ts, ok := r.userTimes[userID]
+	if !ok {
+		return 0
+	}
+	lo := sort.Search(len(ts), func(i int) bool { return !ts[i].Before(from) })
+	hi := sort.Search(len(ts), func(i int) bool { return ts[i].After(to) })
+	return hi - lo
 }
 
 func (r *MemoryRepo) GetLastID() int64 {

@@ -23,16 +23,17 @@ func NewMailer(cfg *config.Config, log *zap.Logger) *Mailer {
 
 // SendAlert формирует и отправляет письмо об аномалии.
 // recipients — строка адресов через запятую.
-func (m *Mailer) SendAlert(ev model.AccessEvent, threshold float64, recipients string) {
+// Возвращает nil, если письмо отправлено либо осознанно пропущено
+// (SMTP не настроен), и ошибку, если отправка не удалась.
+func (m *Mailer) SendAlert(ev model.AccessEvent, threshold float64, recipients string) error {
 	if m.cfg.SMTPUser == "" || recipients == "" {
 		m.log.Debug("SMTP не настроен или получатели не заданы, письмо пропущено")
-		return
+		return nil
 	}
-	return
 
 	addrs := splitRecipients(recipients)
 	if len(addrs) == 0 {
-		return
+		return nil
 	}
 
 	subject := fmt.Sprintf("[ANOMALY] User %d — score %.2f (порог %.2f)",
@@ -53,18 +54,12 @@ func (m *Mailer) SendAlert(ev model.AccessEvent, threshold float64, recipients s
 		m.cfg.SMTPPassword,
 	)
 
+	// Результат отправки журналирует вызывающая сторона (service.sendAlerts),
+	// чтобы запись в журнале соответствовала фактическому исходу.
 	if err := d.DialAndSend(msg); err != nil {
-		m.log.Error("ошибка отправки письма",
-			zap.String("to", recipients),
-			zap.Error(err),
-		)
-		return
+		return fmt.Errorf("отправка письма на %s: %w", recipients, err)
 	}
-
-	m.log.Info("письмо отправлено",
-		zap.String("to", recipients),
-		zap.Int64("user_id", ev.UserID),
-	)
+	return nil
 }
 
 func (m *Mailer) buildBody(ev model.AccessEvent, threshold float64) string {
